@@ -1,0 +1,496 @@
+
+import json
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+# =========================================================
+# FridgeSmart - Food Inventory and Estimated Storage Tracker
+# =========================================================
+
+DATA_FILE = Path(__file__).with_name("fridgesmart_inventory.json")
+
+SHELF_LIFE = {
+    # Fruits
+    "strawberry": (1, 3), "mango": (4, 7),
+    "raw mango": (7, 14), "orange": (7, 14),
+    "grapes": (2, 7), "lemon": (10, 21),
+    "watermelon": (3, 7), "melon": (3, 7),
+    "pomegranate": (7, 30), "banana": (3, 6),
+    "chickoo": (3, 7), "blueberry": (2, 10),
+    "raspberry": (1, 3), "dragon fruit": (3, 7),
+    "peach": (3, 7), "cherry": (3, 10),
+    "pear": (4, 14), "fig": (1, 3), "apple": (7, 21),
+
+    # Vegetables
+    "spinach": (1, 3), "lettuce": (1, 5),
+    "carrot": (7, 21), "cucumber": (3, 7),
+    "broccoli": (2, 5), "cabbage": (5, 14),
+    "onion": (30, 45), "garlic": (60, 90),
+    "bell pepper": (3, 7), "mushroom": (2, 5),
+    "potato": (30, 45), "tomato": (4, 7),
+    "napa cabbage": (2, 7),
+
+    # Dairy
+    "milk": (0, 5), "cheese": (1, 21),
+    "yogurt": (0, 14), "butter": (0, 30),
+    "cream": (0, 7),
+
+    # Proteins
+    "chicken": (0, 2), "beef": (0, 2),
+    "pork": (0, 2), "fish": (0, 1),
+    "egg": (14, 28), "tofu": (1, 5),
+    "shrimp": (0, 1),
+
+    # Grains and pantry
+    "wheat": (180, 365), "flour": (180, 365),
+    "sugar": (730, 730), "oats": (365, 365),
+    "pasta": (730, 730), "rice": (180, 180),
+
+    # Korean staples
+    "kimchi": (1, 30), "gochujang": (60, 180),
+    "doenjang": (90, 365), "soy sauce": (365, 365),
+    "gochugaru": (180, 365), "sesame oil": (180, 365),
+}
+
+# Values are (room-temperature estimate, refrigerator estimate).
+# These are generic estimates, NOT guaranteed food-safety limits.
+CATEGORY_FALLBACKS = {
+    "meat": (0, 2),
+    "dairy": (0, 7),
+    "vegetable": (3, 10),
+    "fruit": (3, 7),
+    "pantry": (180, 365),
+    "other": (3, 7),
+}
+
+# Exact aliases avoid many common spelling/plural problems.
+ALIASES = {
+    "strawberries": "strawberry",
+    "mangoes": "mango",
+    "oranges": "orange",
+    "grape": "grapes",
+    "lemons": "lemon",
+    "bananas": "banana",
+    "blueberries": "blueberry",
+    "raspberries": "raspberry",
+    "peaches": "peach",
+    "cherries": "cherry",
+    "pears": "pear",
+    "apples": "apple",
+    "carrots": "carrot",
+    "cucumbers": "cucumber",
+    "potatoes": "potato",
+    "onions": "onion",
+    "mushrooms": "mushroom",
+    "eggs": "egg",
+    "prawns": "shrimp",
+    "yoghurt": "yogurt",
+    "curd": "yogurt",
+    "bell peppers": "bell pepper",
+    "capsicum": "bell pepper",
+    "sweet potato": "potato",
+}
+
+CATEGORIES = tuple(CATEGORY_FALLBACKS.keys())
+
+
+def normalize(text):
+    """Normalize spacing and capitalization."""
+    return " ".join(text.casefold().strip().split())
+
+
+def read_date(prompt, allow_future=True):
+    """Read and validate a date in YYYY-MM-DD format."""
+    while True:
+        raw = input(prompt).strip()
+
+        try:
+            parsed = datetime.strptime(raw, "%Y-%m-%d").date()
+
+            if parsed.isoformat() != raw:
+                raise ValueError
+
+            if not allow_future and parsed > date.today():
+                print("Date cannot be in the future.")
+                continue
+
+            return parsed
+
+        except ValueError:
+            print("Enter a valid date in YYYY-MM-DD format.")
+
+
+def read_category():
+    """Allow the user to select a category."""
+    print("\nCategories:")
+    for number, category in enumerate(CATEGORIES, 1):
+        print(f"{number}. {category.title()}")
+    print("0. Auto-detect / unknown")
+
+    choice = input("Choose category: ").strip()
+
+    if choice == "0" or choice == "":
+        return ""
+
+    if choice.isdigit() and 1 <= int(choice) <= len(CATEGORIES):
+        return CATEGORIES[int(choice) - 1]
+
+    print("Invalid category. Using auto-detection.")
+    return ""
+
+
+def guess_category(food):
+    """Use exact known ingredient names where possible."""
+    if food in SHELF_LIFE:
+        # The category is not needed for known ingredients.
+        return ""
+
+    groups = {
+        "meat": {
+            "chicken", "beef", "pork", "fish", "lamb",
+            "turkey", "shrimp", "prawn", "salmon", "tuna",
+            "meat", "seafood",
+        },
+        "dairy": {
+            "milk", "cheese", "yogurt", "butter", "cream",
+            "paneer", "ghee", "curd",
+        },
+        "vegetable": {
+            "spinach", "lettuce", "carrot", "broccoli",
+            "cabbage", "potato", "onion", "tomato",
+            "cucumber", "pepper", "bell pepper", "capsicum",
+            "mushroom", "zucchini", "pumpkin", "cauliflower",
+            "okra", "brinjal", "eggplant", "peas", "beans",
+        },
+        "fruit": {
+            "apple", "banana", "orange", "berry", "mango",
+            "grape", "grapes", "lemon", "lime", "melon",
+            "peach", "pear", "plum", "pineapple", "papaya",
+            "guava", "chickoo", "fig", "cherry",
+            "pomegranate", "dragon fruit", "strawberry",
+            "blueberry", "raspberry", "watermelon",
+        },
+        "pantry": {
+            "wheat", "flour", "sugar", "oats", "pasta",
+            "rice", "oil", "sauce", "powder", "spice",
+            "salt", "lentils", "beans", "cereal",
+        },
+    }
+
+    for category, ingredients in groups.items():
+        if food in ingredients:
+            return category
+
+    return "other"
+
+
+def get_shelf_days(food, storage, user_category=""):
+    """Return estimated storage days and the source of the estimate."""
+    food = ALIASES.get(normalize(food), normalize(food))
+
+    if storage not in ("room", "fridge"):
+        raise ValueError("Storage must be room or fridge.")
+
+    if food in SHELF_LIFE:
+        days = SHELF_LIFE[food][0 if storage == "room" else 1]
+        return food, days, "ingredient database"
+
+    category = user_category or guess_category(food)
+
+    if category not in CATEGORY_FALLBACKS:
+        category = "other"
+
+    days = CATEGORY_FALLBACKS[category][
+        0 if storage == "room" else 1
+    ]
+
+    return food, days, f"{category} fallback estimate"
+
+
+def load_inventory():
+    """Load saved inventory, handling missing or invalid files."""
+    if not DATA_FILE.exists():
+        return []
+
+    try:
+        with DATA_FILE.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        if not isinstance(data, list):
+            raise ValueError("Inventory must be a list.")
+
+        valid_items = []
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                if not isinstance(item.get("id"), int):
+                    continue
+
+                if not isinstance(item.get("food"), str):
+                    continue
+
+                if not item["food"].strip():
+                    continue
+
+                if item.get("storage") not in ("room", "fridge"):
+                    continue
+
+                for field in ("purchase", "estimated_date"):
+                    datetime.strptime(item[field], "%Y-%m-%d")
+
+                if not isinstance(item.get("shelf_days"), int):
+                    continue
+
+                if item["shelf_days"] < 0:
+                    continue
+
+                valid_items.append(item)
+
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        return valid_items
+
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        print(f"Could not read saved inventory: {error}")
+        print("Your saved file has not been overwritten.")
+        return None
+
+
+def save_inventory(inventory):
+    """Save changes safely using a temporary file."""
+    temp_file = DATA_FILE.with_suffix(".tmp")
+
+    try:
+        with temp_file.open("w", encoding="utf-8") as file:
+            json.dump(inventory, file, indent=2, ensure_ascii=False)
+
+        temp_file.replace(DATA_FILE)
+        return True
+
+    except OSError as error:
+        print(f"Could not save inventory: {error}")
+        print("Your latest changes may be lost after exiting.")
+        return False
+
+
+def remaining_days(item):
+    """Calculate remaining estimated days at the time of viewing."""
+    estimated = date.fromisoformat(item["estimated_date"])
+    return (estimated - date.today()).days
+
+
+def item_status(item):
+    days = remaining_days(item)
+
+    if days < 0:
+        return "PAST ESTIMATED DATE"
+    if days <= 2:
+        return "CHECK / USE SOON"
+    return "WITHIN ESTIMATED PERIOD"
+
+
+def add_item(inventory):
+    print("\n--- Add Food Item ---")
+
+    food = input("Food name: ").strip()
+
+    if not food:
+        print("Food name cannot be empty.")
+        return
+
+    storage = input("Storage (room/fridge): ").strip().casefold()
+
+    if storage not in ("room", "fridge"):
+        print("Please enter either 'room' or 'fridge'.")
+        return
+
+    purchase = read_date(
+        "Purchase date (YYYY-MM-DD): ",
+        allow_future=False,
+    )
+
+    category = read_category()
+
+    food, days, source = get_shelf_days(food, storage, category)
+    estimated = purchase + timedelta(days=days)
+
+    next_id = max(
+        (item["id"] for item in inventory),
+        default=0,
+    ) + 1
+
+    item = {
+        "id": next_id,
+        "food": food,
+        "storage": storage,
+        "purchase": purchase.isoformat(),
+        "estimated_date": estimated.isoformat(),
+        "shelf_days": days,
+        "estimate_source": source,
+        "category": category or guess_category(food),
+    }
+
+    inventory.append(item)
+
+    print("\nItem added.")
+    print(f"Food: {food.title()}")
+    print(f"Estimated date: {estimated.isoformat()}")
+    print(f"Estimate source: {source}")
+    print(f"Days remaining: {remaining_days(item)}")
+
+    if storage == "room" and item["category"] in ("meat", "dairy"):
+        print(
+            "WARNING: Perishable food may require refrigeration "
+            "or immediate disposal if left out too long. "
+            "Do not rely on this estimated date."
+        )
+
+    print("Reminder: this is an estimate, not a safety guarantee.")
+
+    save_inventory(inventory)
+
+
+def view_inventory(inventory):
+    print("\n--- Food Inventory ---")
+
+    if not inventory:
+        print("Your inventory is empty.")
+        return
+
+    for item in sorted(inventory, key=lambda x: x["id"]):
+        print("-" * 45)
+        print(f"ID: {item['id']} | {item['food'].title()}")
+        print(f"Storage: {item['storage'].title()}")
+        print(f"Purchased: {item['purchase']}")
+        print(f"Estimated date: {item['estimated_date']}")
+        print(f"Status: {item_status(item)}")
+
+        days = remaining_days(item)
+        if days >= 0:
+            print(f"Days until estimated date: {days}")
+        else:
+            print(f"Days past estimated date: {abs(days)}")
+
+    print("-" * 45)
+    print("Dates are estimates, not proof that food is safe.")
+
+
+def search_inventory(inventory):
+    query = normalize(input("\nSearch food name: "))
+
+    if not query:
+        print("Search cannot be empty.")
+        return
+
+    matches = [
+        item for item in inventory
+        if query in normalize(item["food"])
+    ]
+
+    if not matches:
+        print("No matching items found.")
+        return
+
+    print("\n--- Search Results ---")
+    for item in matches:
+        print(
+            f"ID {item['id']}: {item['food'].title()} | "
+            f"{item['storage']} | "
+            f"Estimated date: {item['estimated_date']} | "
+            f"{item_status(item)}"
+        )
+
+
+def remove_item(inventory):
+    view_inventory(inventory)
+
+    if not inventory:
+        return
+
+    raw = input("\nEnter item ID to remove (or 0 to cancel): ").strip()
+
+    if not raw.isdigit():
+        print("Please enter a valid numeric ID.")
+        return
+
+    item_id = int(raw)
+
+    if item_id == 0:
+        print("Removal cancelled.")
+        return
+
+    for item in inventory:
+        if item["id"] == item_id:
+            confirm = input(
+                f"Remove {item['food'].title()}? (yes/no): "
+            ).strip().casefold()
+
+            if confirm == "yes":
+                inventory.remove(item)
+                save_inventory(inventory)
+                print("Item removed.")
+            else:
+                print("Removal cancelled.")
+            return
+
+    print("No item found with that ID.")
+
+
+def show_menu():
+    print("\n" + "=" * 35)
+    print("          FRIDGESMART")
+    print("=" * 35)
+    print("1. Add food item")
+    print("2. View inventory")
+    print("3. Search inventory")
+    print("4. Remove food item")
+    print("5. Exit")
+    print("-" * 35)
+
+
+def main():
+    inventory = load_inventory()
+
+    # None indicates that the saved file could not be read.
+    if inventory is None:
+        print("Inventory could not be loaded safely.")
+        print("Resolve the file problem before making changes.")
+        return
+
+    print("Welcome to FridgeSmart!")
+    print(f"Loaded {len(inventory)} saved item(s).")
+
+    while True:
+        show_menu()
+        choice = input("Choose an option (1-5): ").strip()
+
+        if choice == "1":
+            add_item(inventory)
+
+        elif choice == "2":
+            view_inventory(inventory)
+
+        elif choice == "3":
+            search_inventory(inventory)
+
+        elif choice == "4":
+            remove_item(inventory)
+
+        elif choice == "5":
+            print("Your inventory is saved. Goodbye!")
+            break
+
+        else:
+            print("Invalid choice. Please enter a number from 1 to 5.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print("\nProgram interrupted. Previously saved data remains intact.")
+   
